@@ -123,55 +123,81 @@ function remuxStreamWithFfmpeg(streamUrl, outputPath) {
   });
 }
 
-async function uploadToVidara(filePath, filename, folderId) {
-  const uploadServer = await getVidaraUploadServer();
-  const fileBuffer = fs.readFileSync(filePath);
-  const blob = new Blob([fileBuffer], { type: 'video/mp4' });
-
-  const formData = new FormData();
-  formData.append('api_key', VIDARA_API_KEY);
-  formData.append('file', blob, filename);
-  if (folderId) {
-    formData.append('fld_id', String(folderId));
-    formData.append('folder_id', String(folderId));
-  }
-
-  const res = await fetch(uploadServer, {
-    method: 'POST',
-    body: formData
-  });
-
-  if (!res.ok) {
-    cachedUploadServer = null; // Invalidate cache on failure
-    throw new Error(`Vidara upload HTTP error: ${res.status}`);
-  }
-
-  const json = await res.json();
-  let filecode = json.filecode || json.result?.filecode || json.data?.filecode;
-  if (!filecode) {
-    throw new Error(`Vidara response missing filecode: ${JSON.stringify(json)}`);
-  }
-
-  // Clean filecode if returned as full URL
-  filecode = filecode.replace(/^https?:\/\/vidara\.[^/]+\/e\//, '').trim();
-
-  // Call official move endpoint to guarantee file is in the target folder
-  if (folderId) {
+async function uploadToVidara(filePath, filename, folderId, maxRetries = 5) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const moveRes = await fetch(`https://api.vidara.so/v1/video/move?api_key=${VIDARA_API_KEY}&filecode=${filecode}&fld_id=${folderId}`);
-      if (moveRes.ok) {
-        console.log(`   📁 File [${filecode}] saved into Vidara Folder #${folderId}`);
+      const uploadServer = await getVidaraUploadServer();
+      const fileBuffer = fs.readFileSync(filePath);
+      const blob = new Blob([fileBuffer], { type: 'video/mp4' });
+
+      const formData = new FormData();
+      formData.append('api_key', VIDARA_API_KEY);
+      formData.append('file', blob, filename);
+      if (folderId) {
+        formData.append('fld_id', String(folderId));
+        formData.append('folder_id', String(folderId));
       }
-    } catch (moveErr) {
-      console.warn(`   ⚠️ Warning: Folder move error: ${moveErr.message}`);
+
+      const res = await fetch(uploadServer, {
+        method: 'POST',
+        body: formData
+      });
+
+      if (res.status === 429 || res.status === 502 || res.status === 503) {
+        cachedUploadServer = null; // Invalidate upload server cache
+        const waitSec = attempt * 12; // 12s, 24s, 36s...
+        console.warn(`   ⏳ Vidara upload HTTP ${res.status} (Rate limit/busy). Pausing ${waitSec}s (Attempt ${attempt}/${maxRetries})...`);
+        await new Promise(r => setTimeout(r, waitSec * 1000));
+        continue;
+      }
+
+      if (!res.ok) {
+        cachedUploadServer = null;
+        throw new Error(`Vidara upload HTTP error: ${res.status}`);
+      }
+
+      const json = await res.json();
+      let filecode = json.filecode || json.result?.filecode || json.data?.filecode;
+      if (!filecode) {
+        const raw = JSON.stringify(json);
+        if (raw.includes('Rate limit') || raw.includes('429')) {
+          cachedUploadServer = null;
+          const waitSec = attempt * 15;
+          console.warn(`   ⏳ Vidara API rate limit in JSON body. Pausing ${waitSec}s (Attempt ${attempt}/${maxRetries})...`);
+          await new Promise(r => setTimeout(r, waitSec * 1000));
+          continue;
+        }
+        throw new Error(`Vidara response missing filecode: ${raw}`);
+      }
+
+      // Clean filecode if returned as full URL
+      filecode = filecode.replace(/^https?:\/\/vidara\.[^/]+\/e\//, '').trim();
+
+      // Call official move endpoint to guarantee file is in the target folder
+      if (folderId) {
+        try {
+          const moveRes = await fetch(`https://api.vidara.so/v1/video/move?api_key=${VIDARA_API_KEY}&filecode=${filecode}&fld_id=${folderId}`);
+          if (moveRes.ok) {
+            console.log(`   📁 File [${filecode}] confirmed in Vidara Folder #${folderId}`);
+          }
+        } catch (moveErr) {
+          console.warn(`   ⚠️ Warning: Folder move error: ${moveErr.message}`);
+        }
+      }
+
+      return {
+        filecode,
+        embedUrl: `https://vidara.to/e/${filecode}`,
+        watchUrl: `https://vidara.to/${filecode}`
+      };
+    } catch (err) {
+      if (attempt === maxRetries) throw err;
+      const waitSec = attempt * 6;
+      console.warn(`   ⚠️ Upload attempt ${attempt} error: ${err.message}. Retrying in ${waitSec}s...`);
+      await new Promise(r => setTimeout(r, waitSec * 1000));
     }
   }
-
-  return {
-    filecode,
-    embedUrl: `https://vidara.to/e/${filecode}`,
-    watchUrl: `https://vidara.to/${filecode}`
-  };
+  throw new Error(`Failed to upload to Vidara after ${maxRetries} attempts`);
 }
 
 async function main() {
@@ -376,7 +402,8 @@ async function main() {
 
       } catch (err) {
         console.error(`   ❌ Failed uploading episode #${ep.id}:`, err.message);
-        await pool.query(`UPDATE anime_episodes SET stream_type = 'HLS_ERROR' WHERE id = ?`, [ep.id]);
+        // Do NOT mark as permanent HLS_ERROR on upload network/rate-limit failure.
+        // It stays as 'HLS' to be retried safely on the next pass.
       } finally {
         // Always clean up temp file
         if (finalTempFile && fs.existsSync(finalTempFile)) {
