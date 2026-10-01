@@ -53,6 +53,12 @@ jobs:
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_NAME: ${{ secrets.DB_NAME }}
+          VIDARA_API_KEY_1: ${{ secrets.VIDARA_API_KEY_1 }}
+          FOLDER_SERIES_ID_1: ${{ secrets.FOLDER_SERIES_ID_1 }}
+          FOLDER_MOVIE_ID_1: ${{ secrets.FOLDER_MOVIE_ID_1 }}
+          VIDARA_API_KEY_2: ${{ secrets.VIDARA_API_KEY_2 }}
+          FOLDER_SERIES_ID_2: ${{ secrets.FOLDER_SERIES_ID_2 }}
+          FOLDER_MOVIE_ID_2: ${{ secrets.FOLDER_MOVIE_ID_2 }}
           VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
           FOLDER_SERIES_ID: ${{ secrets.FOLDER_SERIES_ID }}
           FOLDER_MOVIE_ID: ${{ secrets.FOLDER_MOVIE_ID }}

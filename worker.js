@@ -19,7 +19,27 @@ const DB_PORT = parseInt(process.env.DB_PORT || '3306');
 const DB_USER = process.env.DB_USER || 'jeevanka_user';
 const DB_PASSWORD = process.env.DB_PASSWORD || '';
 const DB_NAME = process.env.DB_NAME || 'jeevanka_anime';
-const VIDARA_API_KEY = process.env.VIDARA_API_KEY || '';
+// ==============================================================================
+// 👥 Multi-Account Failover & Rotation Pool
+// ==============================================================================
+const ACCOUNT_POOL = [
+  {
+    id: 1,
+    name: 'Account 1 (elfen0909)',
+    apiKey: process.env.VIDARA_API_KEY_1 || '487cfda837c6b45562f3ecdcdda3d62dd6622c5ecb12887fa9ff59ec023585a7',
+    folderSeries: parseInt(process.env.FOLDER_SERIES_ID_1 || '32797', 10),
+    folderMovie: parseInt(process.env.FOLDER_MOVIE_ID_1 || '32791', 10),
+    isExhausted: false
+  },
+  {
+    id: 2,
+    name: 'Account 2 (alex09op)',
+    apiKey: process.env.VIDARA_API_KEY_2 || process.env.VIDARA_API_KEY || 'a3dd10efa43ce85c2f04ebd2b3977754f86ff27160178280e786c151784e5d47',
+    folderSeries: parseInt(process.env.FOLDER_SERIES_ID_2 || process.env.FOLDER_SERIES_ID || '33143', 10),
+    folderMovie: parseInt(process.env.FOLDER_MOVIE_ID_2 || process.env.FOLDER_MOVIE_ID || '33142', 10),
+    isExhausted: false
+  }
+];
 
 const SHARD_INDEX = parseInt(process.env.SHARD_INDEX || '0', 10);
 const TOTAL_SHARDS = parseInt(process.env.TOTAL_SHARDS || '1', 10);
@@ -34,10 +54,6 @@ const QUALITY_SPECS = [
   { label: '360p',  code: 'baa' },
   { label: '240p',  code: 'oaa' }
 ];
-
-// Vidara Folder IDs (Configurable with fallback to new folder IDs)
-const FOLDER_SERIES_ID = parseInt(process.env.FOLDER_SERIES_ID || '33143', 10); // Hindi Series: https://vidara.so/files?folder_id=33143
-const FOLDER_MOVIE_ID  = parseInt(process.env.FOLDER_MOVIE_ID || '33142', 10);  // Movies:       https://vidara.so/files?folder_id=33142
 
 function parseRanges(rangesStr) {
   const map = {};
@@ -68,21 +84,20 @@ async function checkStreamReachable(streamUrl) {
   }
 }
 
-let cachedUploadServer = null;
-let lastServerFetch = 0;
+const uploadServerCache = new Map();
 
-async function getVidaraUploadServer() {
+async function getVidaraUploadServer(apiKey) {
   const now = Date.now();
-  if (cachedUploadServer && (now - lastServerFetch < 300000)) { // 5 min cache
-    return cachedUploadServer;
+  const cached = uploadServerCache.get(apiKey);
+  if (cached && (now - cached.time < 300000)) { // 5 min cache
+    return cached.server;
   }
-  const res = await fetch(`https://api.vidara.so/v1/upload/server?api_key=${VIDARA_API_KEY}`);
+  const res = await fetch(`https://api.vidara.so/v1/upload/server?api_key=${apiKey}`);
   if (!res.ok) throw new Error(`Vidara server API error: HTTP ${res.status}`);
   const json = await res.json();
   const server = json.result?.upload_server || json.data?.upload_server;
   if (!server) throw new Error(`Failed to get Vidara upload server: ${JSON.stringify(json)}`);
-  cachedUploadServer = server;
-  lastServerFetch = now;
+  uploadServerCache.set(apiKey, { server, time: now });
   return server;
 }
 
@@ -134,19 +149,22 @@ function remuxStreamWithFfmpeg(streamUrl, outputPath) {
   });
 }
 
-async function uploadToVidara(filePath, filename, folderId, maxRetries = 5) {
+async function uploadToSingleAccount(account, filePath, filename, isMovie, maxRetries = 4) {
+  const targetFolderId = isMovie ? account.folderMovie : account.folderSeries;
+  const folderLabel = isMovie ? `Movies (Folder #${account.folderMovie})` : `Series (Folder #${account.folderSeries})`;
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const uploadServer = await getVidaraUploadServer();
+      const uploadServer = await getVidaraUploadServer(account.apiKey);
       const fileBuffer = fs.readFileSync(filePath);
       const blob = new Blob([fileBuffer], { type: 'video/mp4' });
 
       const formData = new FormData();
-      formData.append('api_key', VIDARA_API_KEY);
+      formData.append('api_key', account.apiKey);
       formData.append('file', blob, filename);
-      if (folderId) {
-        formData.append('fld_id', String(folderId));
-        formData.append('folder_id', String(folderId));
+      if (targetFolderId) {
+        formData.append('fld_id', String(targetFolderId));
+        formData.append('folder_id', String(targetFolderId));
       }
 
       const res = await fetch(uploadServer, {
@@ -160,32 +178,34 @@ async function uploadToVidara(filePath, filename, folderId, maxRetries = 5) {
 
       if (resText.includes('Daily upload limit reached') || json?.error?.includes('Daily upload limit reached')) {
         const msg = json?.error || resText;
-        cachedUploadServer = null;
-        const limitErr = new Error(`DAILY_LIMIT: ${msg}`);
+        uploadServerCache.delete(account.apiKey);
+        account.isExhausted = true;
+        const limitErr = new Error(`DAILY_LIMIT [${account.name}]: ${msg}`);
         limitErr.isDailyLimit = true;
+        limitErr.accountName = account.name;
         throw limitErr;
       }
 
       if (res.status === 429 || res.status === 502 || res.status === 503) {
-        cachedUploadServer = null; // Invalidate upload server cache
-        const waitSec = attempt * 12; // 12s, 24s, 36s...
-        console.warn(`   ⏳ Vidara upload HTTP ${res.status} (Rate limit/busy). Pausing ${waitSec}s (Attempt ${attempt}/${maxRetries})...`);
+        uploadServerCache.delete(account.apiKey);
+        const waitSec = attempt * 10;
+        console.warn(`   ⏳ [${account.name}] upload HTTP ${res.status}. Pausing ${waitSec}s (Attempt ${attempt}/${maxRetries})...`);
         await new Promise(r => setTimeout(r, waitSec * 1000));
         continue;
       }
 
       if (!res.ok) {
-        cachedUploadServer = null;
-        throw new Error(`Vidara upload HTTP error: ${res.status} - ${resText.slice(0, 100)}`);
+        uploadServerCache.delete(account.apiKey);
+        throw new Error(`Vidara upload HTTP ${res.status}: ${resText.slice(0, 100)}`);
       }
 
       let filecode = json?.filecode || json?.result?.filecode || json?.data?.filecode;
       if (!filecode) {
         const raw = resText;
         if (raw.includes('Rate limit') || raw.includes('429')) {
-          cachedUploadServer = null;
-          const waitSec = attempt * 15;
-          console.warn(`   ⏳ Vidara API rate limit in JSON body. Pausing ${waitSec}s (Attempt ${attempt}/${maxRetries})...`);
+          uploadServerCache.delete(account.apiKey);
+          const waitSec = attempt * 12;
+          console.warn(`   ⏳ [${account.name}] API rate limit in body. Pausing ${waitSec}s...`);
           await new Promise(r => setTimeout(r, waitSec * 1000));
           continue;
         }
@@ -196,11 +216,11 @@ async function uploadToVidara(filePath, filename, folderId, maxRetries = 5) {
       filecode = filecode.replace(/^https?:\/\/vidara\.[^/]+\/e\//, '').trim();
 
       // Call official move endpoint to guarantee file is in the target folder
-      if (folderId) {
+      if (targetFolderId) {
         try {
-          const moveRes = await fetch(`https://api.vidara.so/v1/video/move?api_key=${VIDARA_API_KEY}&filecode=${filecode}&fld_id=${folderId}`);
+          const moveRes = await fetch(`https://api.vidara.so/v1/video/move?api_key=${account.apiKey}&filecode=${filecode}&fld_id=${targetFolderId}`);
           if (moveRes.ok) {
-            console.log(`   📁 File [${filecode}] confirmed in Vidara Folder #${folderId}`);
+            console.log(`   📁 Confirmed in ${account.name} (Folder #${targetFolderId})`);
           }
         } catch (moveErr) {
           console.warn(`   ⚠️ Warning: Folder move error: ${moveErr.message}`);
@@ -210,17 +230,48 @@ async function uploadToVidara(filePath, filename, folderId, maxRetries = 5) {
       return {
         filecode,
         embedUrl: `https://vidara.to/e/${filecode}`,
-        watchUrl: `https://vidara.to/${filecode}`
+        watchUrl: `https://vidara.to/${filecode}`,
+        accountName: account.name,
+        folderLabel
       };
     } catch (err) {
       if (err.isDailyLimit) throw err;
       if (attempt === maxRetries) throw err;
-      const waitSec = attempt * 6;
-      console.warn(`   ⚠️ Upload attempt ${attempt} error: ${err.message}. Retrying in ${waitSec}s...`);
+      const waitSec = attempt * 5;
+      console.warn(`   ⚠️ [${account.name}] Upload attempt ${attempt} error: ${err.message}. Retrying in ${waitSec}s...`);
       await new Promise(r => setTimeout(r, waitSec * 1000));
     }
   }
-  throw new Error(`Failed to upload to Vidara after ${maxRetries} attempts`);
+  throw new Error(`Failed to upload to ${account.name} after ${maxRetries} attempts`);
+}
+
+async function uploadWithFailover(filePath, filename, isMovie) {
+  // Check if any accounts available
+  const available = ACCOUNT_POOL.filter(a => !a.isExhausted);
+  if (available.length === 0) {
+    const allErr = new Error('ALL_ACCOUNTS_DAILY_LIMIT_EXHAUSTED');
+    allErr.allAccountsExhausted = true;
+    throw allErr;
+  }
+
+  for (const account of available) {
+    try {
+      console.log(`   📤 Trying upload to ${account.name}...`);
+      const result = await uploadToSingleAccount(account, filePath, filename, isMovie);
+      return result;
+    } catch (err) {
+      if (err.isDailyLimit) {
+        console.warn(`\n⚠️  >>> ${account.name} DAILY LIMIT (200/day) REACHED! <<<`);
+        console.warn(`   🔄 Auto-Failover: Switching to next available account in pool...\n`);
+        continue; // Try next account in pool immediately with same remuxed file!
+      }
+      throw err;
+    }
+  }
+
+  const allErr = new Error('ALL_ACCOUNTS_DAILY_LIMIT_EXHAUSTED');
+  allErr.allAccountsExhausted = true;
+  throw allErr;
 }
 
 async function main() {
@@ -231,8 +282,9 @@ async function main() {
   if (TARGET_TMDB_ID) console.log(`🎯 Target TMDB ID: ${TARGET_TMDB_ID}`);
   console.log(`=============================================================\n`);
 
-  if (!VIDARA_API_KEY) {
-    console.error('❌ Missing VIDARA_API_KEY environment variable!');
+  const activeKeys = ACCOUNT_POOL.filter(a => !!a.apiKey);
+  if (activeKeys.length === 0) {
+    console.error('❌ No Vidara API keys configured in ACCOUNT_POOL!');
     process.exit(1);
   }
 
@@ -248,13 +300,19 @@ async function main() {
     keepAliveInitialDelay: 10000
   });
 
-  try {
-    const userRes = await fetch(`https://api.vidara.so/v1/user/info?api_key=${VIDARA_API_KEY}`);
-    if (userRes.ok) {
-      const uData = await userRes.json();
-      console.log(`👤 Vidara Account: ${uData.result?.username} | Premium: ${uData.result?.premium} | Total Uploads: ${uData.result?.videos_total}`);
+  console.log(`👥 MULTI-ACCOUNT FAILOVER POOL:`);
+  for (const acc of ACCOUNT_POOL) {
+    try {
+      const uRes = await fetch(`https://api.vidara.so/v1/user/info?api_key=${acc.apiKey}`);
+      if (uRes.ok) {
+        const u = await uRes.json();
+        console.log(`   * ${acc.name}: User=${u.result?.username} | Total Videos=${u.result?.videos_total} | Folders: Series #${acc.folderSeries}, Movies #${acc.folderMovie}`);
+      }
+    } catch (e) {
+      console.warn(`   * ${acc.name}: Probe warning - ${e.message}`);
     }
-  } catch {}
+  }
+  console.log(``);
 
   let processedCount = 0;
   const tempDir = path.resolve('./temp');
@@ -366,15 +424,10 @@ async function main() {
 
       try {
         const isMovie = (ep.format && String(ep.format).toLowerCase().trim() === 'movie');
-        const targetFolderId = isMovie ? FOLDER_MOVIE_ID : FOLDER_SERIES_ID;
-        const folderLabel = isMovie ? 'Movies (Folder #32791)' : 'Hindi Series (Folder #32797)';
-
-        console.log(`   📁 Target Folder: ${folderLabel}`);
-        console.log(`   📤 Uploading to Vidara (${finalUploadFilename})...`);
         const upStart = Date.now();
-        const vidaraResult = await uploadToVidara(finalTempFile, finalUploadFilename, targetFolderId);
+        const vidaraResult = await uploadWithFailover(finalTempFile, finalUploadFilename, isMovie);
         const upSec = ((Date.now() - upStart) / 1000).toFixed(1);
-        console.log(`   ✅ Uploaded in ${upSec}s! Filecode: ${vidaraResult.filecode} in ${folderLabel}`);
+        console.log(`   ✅ Uploaded in ${upSec}s via ${vidaraResult.accountName}! Filecode: ${vidaraResult.filecode} (${vidaraResult.folderLabel})`);
 
         // Update Database
         await pool.query(`
@@ -410,10 +463,11 @@ async function main() {
         }
 
       } catch (err) {
-        if (err.isDailyLimit) {
-          console.error(`\n🛑 Shard #${SHARD_INDEX + 1} halted: Vidara account daily quota (200 files/day) is exhausted.`);
+        if (err.allAccountsExhausted) {
+          console.error(`\n🛑 All accounts in the pool (Account 1 & Account 2) have exhausted their 200/day daily limits!`);
+          console.error(`   Combined 400 uploads/day capacity filled.`);
           console.error(`   Free/Expired accounts reset at 00:00 UTC (05:30 AM IST).`);
-          console.error(`   To lift this limit, renew Vidara Premium or provide a fresh account API key.\n`);
+          console.error(`   Shard #${SHARD_INDEX + 1} shutting down gracefully.\n`);
           process.exit(0);
         }
         console.error(`   ❌ Failed uploading episode #${ep.id}:`, err.message);
