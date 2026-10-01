@@ -95,6 +95,9 @@ function remuxStreamWithFfmpeg(streamUrl, outputPath) {
       '-allowed_extensions', 'ALL',
       '-allowed_segment_extensions', 'ALL',
       '-extension_picky', '0',
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
       '-i', streamUrl,
       '-c', 'copy',
       '-movflags', '+faststart',
@@ -105,11 +108,18 @@ function remuxStreamWithFfmpeg(streamUrl, outputPath) {
     const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
 
+    // 8-minute watchdog to prevent stalling forever
+    const timer = setTimeout(() => {
+      try { proc.kill('SIGKILL'); } catch {}
+      reject(new Error('FFmpeg remux timed out after 8 minutes'));
+    }, 480000);
+
     proc.stderr.on('data', (d) => {
       stderr += d.toString();
     });
 
     proc.on('close', (code) => {
+      clearTimeout(timer);
       if (code === 0 && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1000) {
         resolve();
       } else {
@@ -118,6 +128,7 @@ function remuxStreamWithFfmpeg(streamUrl, outputPath) {
     });
 
     proc.on('error', (err) => {
+      clearTimeout(timer);
       reject(err);
     });
   });
@@ -225,27 +236,7 @@ async function main() {
     keepAliveInitialDelay: 10000
   });
 
-  // Auto-organize recent MP4 files into proper Vidara folders (Shard 0 handles once on startup)
-  if (SHARD_INDEX === 0) {
-    try {
-      const [recent] = await pool.query(`
-        SELECT id, filecode, format 
-        FROM anime_episodes 
-        WHERE stream_type = 'MP4' AND LENGTH(filecode) > 6 AND updated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
-        LIMIT 100
-      `);
-      if (recent.length > 0) {
-        console.log(`📁 Organizing ${recent.length} recent MP4s into folders...`);
-        for (const r of recent) {
-          const isMovie = (r.format && String(r.format).toLowerCase().trim() === 'movie');
-          const fldId = isMovie ? FOLDER_MOVIE_ID : FOLDER_SERIES_ID;
-          await fetch(`https://api.vidara.so/v1/video/move?api_key=${VIDARA_API_KEY}&filecode=${r.filecode}&fld_id=${fldId}`).catch(() => {});
-        }
-      }
-    } catch (err) {
-      console.warn(`   ⚠️ Initial folder sync warning: ${err.message}`);
-    }
-  }
+
 
   let processedCount = 0;
   const tempDir = path.resolve('./temp');
