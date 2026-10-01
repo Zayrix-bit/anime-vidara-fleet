@@ -83,10 +83,11 @@ async function getVidaraUploadServer() {
 
 function remuxStreamWithFfmpeg(streamUrl, outputPath) {
   return new Promise((resolve, reject) => {
-    const headers = 'Origin: https://blakiteapi.xyz\r\nReferer: https://blakiteapi.xyz/\r\n';
+    const headers = 'Origin: https://blakiteapi.xyz\r\nReferer: https://blakiteapi.xyz/\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n';
     const args = [
       '-headers', headers,
-      '-allowed_segment_extensions', 'tar,ts,m3u8',
+      '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+      '-allowed_extensions', 'ALL',
       '-extension_picky', '0',
       '-i', streamUrl,
       '-c', 'copy',
