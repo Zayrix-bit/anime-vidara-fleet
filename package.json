@@ -1,0 +1,14 @@
+{
+  "name": "anime-vidara-fleet",
+  "version": "1.0.0",
+  "description": "High-speed GitHub Actions Matrix Fleet for remuxing HLS anime streams and uploading to Vidara",
+  "type": "module",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js",
+    "test-one": "node worker.js --test"
+  },
+  "dependencies": {
+    "mysql2": "^3.9.7"
+  }
+}

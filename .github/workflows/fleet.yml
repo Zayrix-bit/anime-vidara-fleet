@@ -1,0 +1,58 @@
+name: Anime Vidara Fleet Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Run Test Mode (Processes only 1 episode per worker to verify)'
+        required: true
+        type: boolean
+        default: false
+      max_episodes:
+        description: 'Max Episodes per worker (0 for unlimited until queue is empty)'
+        required: false
+        type: string
+        default: '0'
+
+jobs:
+  fleet-runner:
+    name: Fleet Worker Shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: 🎬 Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+
+      - name: 📦 Install Dependencies
+        run: npm install
+
+      - name: 🚀 Run Shard Worker
+        run: node worker.js
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT || '3306' }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          TOTAL_SHARDS: 10
+          MAX_EPISODES: ${{ inputs.max_episodes }}
+          TEST_MODE: ${{ inputs.test_mode }}
