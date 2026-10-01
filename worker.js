@@ -154,6 +154,18 @@ async function uploadToVidara(filePath, filename, folderId, maxRetries = 5) {
         body: formData
       });
 
+      const resText = await res.text();
+      let json = null;
+      try { json = JSON.parse(resText); } catch {}
+
+      if (resText.includes('Daily upload limit reached') || json?.error?.includes('Daily upload limit reached')) {
+        const msg = json?.error || resText;
+        cachedUploadServer = null;
+        const limitErr = new Error(`DAILY_LIMIT: ${msg}`);
+        limitErr.isDailyLimit = true;
+        throw limitErr;
+      }
+
       if (res.status === 429 || res.status === 502 || res.status === 503) {
         cachedUploadServer = null; // Invalidate upload server cache
         const waitSec = attempt * 12; // 12s, 24s, 36s...
@@ -164,13 +176,12 @@ async function uploadToVidara(filePath, filename, folderId, maxRetries = 5) {
 
       if (!res.ok) {
         cachedUploadServer = null;
-        throw new Error(`Vidara upload HTTP error: ${res.status}`);
+        throw new Error(`Vidara upload HTTP error: ${res.status} - ${resText.slice(0, 100)}`);
       }
 
-      const json = await res.json();
-      let filecode = json.filecode || json.result?.filecode || json.data?.filecode;
+      let filecode = json?.filecode || json?.result?.filecode || json?.data?.filecode;
       if (!filecode) {
-        const raw = JSON.stringify(json);
+        const raw = resText;
         if (raw.includes('Rate limit') || raw.includes('429')) {
           cachedUploadServer = null;
           const waitSec = attempt * 15;
@@ -202,6 +213,7 @@ async function uploadToVidara(filePath, filename, folderId, maxRetries = 5) {
         watchUrl: `https://vidara.to/${filecode}`
       };
     } catch (err) {
+      if (err.isDailyLimit) throw err;
       if (attempt === maxRetries) throw err;
       const waitSec = attempt * 6;
       console.warn(`   ⚠️ Upload attempt ${attempt} error: ${err.message}. Retrying in ${waitSec}s...`);
@@ -236,7 +248,13 @@ async function main() {
     keepAliveInitialDelay: 10000
   });
 
-
+  try {
+    const userRes = await fetch(`https://api.vidara.so/v1/user/info?api_key=${VIDARA_API_KEY}`);
+    if (userRes.ok) {
+      const uData = await userRes.json();
+      console.log(`👤 Vidara Account: ${uData.result?.username} | Premium: ${uData.result?.premium} | Total Uploads: ${uData.result?.videos_total}`);
+    }
+  } catch {}
 
   let processedCount = 0;
   const tempDir = path.resolve('./temp');
@@ -392,6 +410,12 @@ async function main() {
         }
 
       } catch (err) {
+        if (err.isDailyLimit) {
+          console.error(`\n🛑 Shard #${SHARD_INDEX + 1} halted: Vidara account daily quota (200 files/day) is exhausted.`);
+          console.error(`   Free/Expired accounts reset at 00:00 UTC (05:30 AM IST).`);
+          console.error(`   To lift this limit, renew Vidara Premium or provide a fresh account API key.\n`);
+          process.exit(0);
+        }
         console.error(`   ❌ Failed uploading episode #${ep.id}:`, err.message);
         // Do NOT mark as permanent HLS_ERROR on upload network/rate-limit failure.
         // It stays as 'HLS' to be retried safely on the next pass.
