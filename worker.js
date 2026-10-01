@@ -51,10 +51,11 @@ function parseRanges(rangesStr) {
 async function checkStreamReachable(streamUrl) {
   try {
     const res = await fetch(streamUrl, {
-      method: 'HEAD',
+      method: 'GET',
       headers: {
         'Origin': 'https://blakiteapi.xyz',
-        'Referer': 'https://blakiteapi.xyz/'
+        'Referer': 'https://blakiteapi.xyz/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
     });
     return res.status === 200;
@@ -88,6 +89,7 @@ function remuxStreamWithFfmpeg(streamUrl, outputPath) {
       '-headers', headers,
       '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
       '-allowed_extensions', 'ALL',
+      '-allowed_segment_extensions', 'ALL',
       '-extension_picky', '0',
       '-i', streamUrl,
       '-c', 'copy',
