@@ -35,9 +35,9 @@ const QUALITY_SPECS = [
   { label: '240p',  code: 'oaa' }
 ];
 
-// Vidara Folder IDs
-const FOLDER_SERIES_ID = 32797; // Hindi Series: https://vidara.so/files?folder_id=32797
-const FOLDER_MOVIE_ID  = 32791; // Movies:       https://vidara.so/files?folder_id=32791
+// Vidara Folder IDs (Configurable with fallback to new folder IDs)
+const FOLDER_SERIES_ID = parseInt(process.env.FOLDER_SERIES_ID || '33143', 10); // Hindi Series: https://vidara.so/files?folder_id=33143
+const FOLDER_MOVIE_ID  = parseInt(process.env.FOLDER_MOVIE_ID || '33142', 10);  // Movies:       https://vidara.so/files?folder_id=33142
 
 function parseRanges(rangesStr) {
   const map = {};

@@ -54,6 +54,8 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_NAME: ${{ secrets.DB_NAME }}
           VIDARA_API_KEY: ${{ secrets.VIDARA_API_KEY }}
+          FOLDER_SERIES_ID: ${{ secrets.FOLDER_SERIES_ID }}
+          FOLDER_MOVIE_ID: ${{ secrets.FOLDER_MOVIE_ID }}
           SHARD_INDEX: ${{ matrix.shard }}
           TOTAL_SHARDS: 10
           MAX_EPISODES: ${{ inputs.max_episodes }}
