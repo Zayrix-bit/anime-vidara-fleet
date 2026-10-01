@@ -48,6 +48,21 @@ function parseRanges(rangesStr) {
   return map;
 }
 
+async function checkStreamReachable(streamUrl) {
+  try {
+    const res = await fetch(streamUrl, {
+      method: 'HEAD',
+      headers: {
+        'Origin': 'https://blakiteapi.xyz',
+        'Referer': 'https://blakiteapi.xyz/'
+      }
+    });
+    return res.status === 200;
+  } catch {
+    return false;
+  }
+}
+
 let cachedUploadServer = null;
 let lastServerFetch = 0;
 
@@ -218,49 +233,61 @@ async function main() {
         continue;
       }
 
-      // Quality selection: Use ep.quality (usually 480p) or match with ranges
-      const targetQuality = (ep.quality || '480p').toLowerCase().trim();
-      let chosenSpec = QUALITY_SPECS.find(s => s.label.toLowerCase() === targetQuality);
-      let chosenRange = ranges[targetQuality];
+      // Cascading Fallback: Try highest available quality first (1080p -> 720p -> 480p -> 360p -> 240p)
+      let successfulRemux = false;
+      let finalSpec = null;
+      let finalTempFile = null;
+      let finalUploadFilename = null;
 
-      // Fallback: If not found, try to find any quality that exists in ranges
-      if (!chosenSpec || !chosenRange) {
-        for (const spec of QUALITY_SPECS) {
-          if (ranges[spec.label.toLowerCase()]) {
-            chosenSpec = spec;
-            chosenRange = ranges[spec.label.toLowerCase()];
-            break;
+      for (const spec of QUALITY_SPECS) {
+        const range = ranges[spec.label.toLowerCase()];
+        // If ranges are provided, make sure this quality has a range
+        if (Object.keys(ranges).length > 0 && !range) continue;
+
+        const rangeParam = range ? `&r_range=${encodeURIComponent(range)}` : '';
+        const streamUrl = `https://hugh.cdn.rumble.cloud/video/${dataId}.${spec.code}.tar?r_file=chunklist.m3u8&r_type=application%2Fvnd.apple.mpegurl${rangeParam}`;
+
+        console.log(`   🔍 Checking quality candidate: ${spec.label}...`);
+        const isReachable = await checkStreamReachable(streamUrl);
+        if (!isReachable) {
+          console.log(`   ⏩ [${spec.label}] not accessible or forbidden, checking next lower quality...`);
+          continue;
+        }
+
+        console.log(`   ⏳ Remuxing HLS (${spec.label}) via FFmpeg...`);
+        const cleanTitle = (ep.anime_title || 'Anime').replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 30);
+        const tempFile = path.join(tempDir, `ep_${ep.id}_${cleanTitle}_s${ep.season}e${ep.episode}_${spec.label}.mp4`);
+        const startTime = Date.now();
+
+        try {
+          await remuxStreamWithFfmpeg(streamUrl, tempFile);
+          const remuxSec = ((Date.now() - startTime) / 1000).toFixed(1);
+          const fileSizeMB = (fs.statSync(tempFile).size / (1024 * 1024)).toFixed(1);
+          console.log(`   ✅ Remuxed ${spec.label} (${fileSizeMB} MB in ${remuxSec}s)`);
+
+          successfulRemux = true;
+          finalSpec = spec;
+          finalTempFile = tempFile;
+          finalUploadFilename = `${cleanTitle}_S${ep.season}E${ep.episode}_${spec.label}.mp4`;
+          break; // Successfully got highest working quality!
+        } catch (ffmpegErr) {
+          console.log(`   ⚠️ FFmpeg failed on ${spec.label}: ${ffmpegErr.message}. Trying next lower quality...`);
+          if (fs.existsSync(tempFile)) {
+            try { fs.unlinkSync(tempFile); } catch {}
           }
         }
       }
 
-      // Default fallback to 480p caa
-      if (!chosenSpec) {
-        chosenSpec = { label: '480p', code: 'caa' };
+      if (!successfulRemux || !finalTempFile) {
+        console.error(`   ❌ All qualities failed for episode #${ep.id}`);
+        await pool.query(`UPDATE anime_episodes SET stream_type = 'HLS_ERROR' WHERE id = ?`, [ep.id]);
+        continue;
       }
-      if (!chosenRange && ranges['480p']) {
-        chosenRange = ranges['480p'];
-      }
-
-      const rangeParam = chosenRange ? `&r_range=${encodeURIComponent(chosenRange)}` : '';
-      const streamUrl = `https://hugh.cdn.rumble.cloud/video/${dataId}.${chosenSpec.code}.tar?r_file=chunklist.m3u8&r_type=application%2Fvnd.apple.mpegurl${rangeParam}`;
-
-      const cleanTitle = (ep.anime_title || 'Anime').replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 30);
-      const tempFile = path.join(tempDir, `ep_${ep.id}_${cleanTitle}_s${ep.season}e${ep.episode}.mp4`);
-      const uploadFilename = `${cleanTitle}_S${ep.season}E${ep.episode}_${chosenSpec.label}.mp4`;
-
-      const startTime = Date.now();
 
       try {
-        console.log(`   ⏳ Remuxing HLS (${chosenSpec.label}) via FFmpeg...`);
-        await remuxStreamWithFfmpeg(streamUrl, tempFile);
-        const remuxSec = ((Date.now() - startTime) / 1000).toFixed(1);
-        const fileSizeMB = (fs.statSync(tempFile).size / (1024 * 1024)).toFixed(1);
-        console.log(`   ✅ Remuxed ${fileSizeMB} MB in ${remuxSec}s`);
-
-        console.log(`   📤 Uploading to Vidara (${uploadFilename})...`);
+        console.log(`   📤 Uploading to Vidara (${finalUploadFilename})...`);
         const upStart = Date.now();
-        const vidaraResult = await uploadToVidara(tempFile, uploadFilename);
+        const vidaraResult = await uploadToVidara(finalTempFile, finalUploadFilename);
         const upSec = ((Date.now() - upStart) / 1000).toFixed(1);
         console.log(`   ✅ Uploaded in ${upSec}s! Filecode: ${vidaraResult.filecode}`);
 
@@ -278,11 +305,11 @@ async function main() {
           vidaraResult.filecode,
           vidaraResult.embedUrl,
           vidaraResult.watchUrl,
-          chosenSpec.label,
+          finalSpec.label,
           ep.id
         ]);
 
-        console.log(`   💾 Database updated: MP4 stream linked!`);
+        console.log(`   💾 Database updated: MP4 stream linked (${finalSpec.label})!`);
         processedCount++;
 
         // Check if entire series is now completed
@@ -298,13 +325,12 @@ async function main() {
         }
 
       } catch (err) {
-        console.error(`   ❌ Failed processing episode #${ep.id}:`, err.message);
-        // Mark as HLS_ERROR to prevent sticking on the same failed episode repeatedly
+        console.error(`   ❌ Failed uploading episode #${ep.id}:`, err.message);
         await pool.query(`UPDATE anime_episodes SET stream_type = 'HLS_ERROR' WHERE id = ?`, [ep.id]);
       } finally {
         // Always clean up temp file
-        if (fs.existsSync(tempFile)) {
-          try { fs.unlinkSync(tempFile); } catch {}
+        if (finalTempFile && fs.existsSync(finalTempFile)) {
+          try { fs.unlinkSync(finalTempFile); } catch {}
         }
       }
     }
