@@ -28,11 +28,11 @@ const TARGET_TMDB_ID = process.env.TARGET_TMDB_ID ? parseInt(process.env.TARGET_
 const IS_TEST = process.argv.includes('--test') || process.env.TEST_MODE === 'true';
 
 const QUALITY_SPECS = [
-  { label: '720p', code: 'gaa' },
   { label: '1080p', code: 'haa' },
-  { label: '480p', code: 'caa' },
-  { label: '360p', code: 'baa' },
-  { label: '240p', code: 'oaa' }
+  { label: '720p',  code: 'gaa' },
+  { label: '480p',  code: 'caa' },
+  { label: '360p',  code: 'baa' },
+  { label: '240p',  code: 'oaa' }
 ];
 
 function parseRanges(rangesStr) {
