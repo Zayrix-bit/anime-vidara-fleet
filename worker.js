@@ -35,6 +35,10 @@ const QUALITY_SPECS = [
   { label: '240p',  code: 'oaa' }
 ];
 
+// Vidara Folder IDs
+const FOLDER_SERIES_ID = 32797; // Hindi Series: https://vidara.so/files?folder_id=32797
+const FOLDER_MOVIE_ID  = 32791; // Movies:       https://vidara.so/files?folder_id=32791
+
 function parseRanges(rangesStr) {
   const map = {};
   if (!rangesStr) return map;
@@ -119,7 +123,7 @@ function remuxStreamWithFfmpeg(streamUrl, outputPath) {
   });
 }
 
-async function uploadToVidara(filePath, filename) {
+async function uploadToVidara(filePath, filename, folderId) {
   const uploadServer = await getVidaraUploadServer();
   const fileBuffer = fs.readFileSync(filePath);
   const blob = new Blob([fileBuffer], { type: 'video/mp4' });
@@ -127,6 +131,10 @@ async function uploadToVidara(filePath, filename) {
   const formData = new FormData();
   formData.append('api_key', VIDARA_API_KEY);
   formData.append('file', blob, filename);
+  if (folderId) {
+    formData.append('fld_id', String(folderId));
+    formData.append('folder_id', String(folderId));
+  }
 
   const res = await fetch(uploadServer, {
     method: 'POST',
@@ -146,6 +154,18 @@ async function uploadToVidara(filePath, filename) {
 
   // Clean filecode if returned as full URL
   filecode = filecode.replace(/^https?:\/\/vidara\.[^/]+\/e\//, '').trim();
+
+  // Call official move endpoint to guarantee file is in the target folder
+  if (folderId) {
+    try {
+      const moveRes = await fetch(`https://api.vidara.so/v1/video/move?api_key=${VIDARA_API_KEY}&filecode=${filecode}&fld_id=${folderId}`);
+      if (moveRes.ok) {
+        console.log(`   📁 File [${filecode}] saved into Vidara Folder #${folderId}`);
+      }
+    } catch (moveErr) {
+      console.warn(`   ⚠️ Warning: Folder move error: ${moveErr.message}`);
+    }
+  }
 
   return {
     filecode,
@@ -179,6 +199,28 @@ async function main() {
     keepAliveInitialDelay: 10000
   });
 
+  // Auto-organize recent MP4 files into proper Vidara folders (Shard 0 handles once on startup)
+  if (SHARD_INDEX === 0) {
+    try {
+      const [recent] = await pool.query(`
+        SELECT id, filecode, format 
+        FROM anime_episodes 
+        WHERE stream_type = 'MP4' AND LENGTH(filecode) > 6 AND updated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        LIMIT 100
+      `);
+      if (recent.length > 0) {
+        console.log(`📁 Organizing ${recent.length} recent MP4s into folders...`);
+        for (const r of recent) {
+          const isMovie = (r.format && String(r.format).toLowerCase().trim() === 'movie');
+          const fldId = isMovie ? FOLDER_MOVIE_ID : FOLDER_SERIES_ID;
+          await fetch(`https://api.vidara.so/v1/video/move?api_key=${VIDARA_API_KEY}&filecode=${r.filecode}&fld_id=${fldId}`).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.warn(`   ⚠️ Initial folder sync warning: ${err.message}`);
+    }
+  }
+
   let processedCount = 0;
   const tempDir = path.resolve('./temp');
   if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
@@ -193,7 +235,7 @@ async function main() {
 
       // Fetch next HLS episode assigned to this shard
       let query = `
-        SELECT id, tmdb_id, anime_title, season, episode, quality, filecode, qualities_json
+        SELECT id, tmdb_id, anime_title, format, season, episode, quality, filecode, qualities_json
         FROM anime_episodes
         WHERE stream_type = 'HLS'
       `;
@@ -288,11 +330,16 @@ async function main() {
       }
 
       try {
+        const isMovie = (ep.format && String(ep.format).toLowerCase().trim() === 'movie');
+        const targetFolderId = isMovie ? FOLDER_MOVIE_ID : FOLDER_SERIES_ID;
+        const folderLabel = isMovie ? 'Movies (Folder #32791)' : 'Hindi Series (Folder #32797)';
+
+        console.log(`   📁 Target Folder: ${folderLabel}`);
         console.log(`   📤 Uploading to Vidara (${finalUploadFilename})...`);
         const upStart = Date.now();
-        const vidaraResult = await uploadToVidara(finalTempFile, finalUploadFilename);
+        const vidaraResult = await uploadToVidara(finalTempFile, finalUploadFilename, targetFolderId);
         const upSec = ((Date.now() - upStart) / 1000).toFixed(1);
-        console.log(`   ✅ Uploaded in ${upSec}s! Filecode: ${vidaraResult.filecode}`);
+        console.log(`   ✅ Uploaded in ${upSec}s! Filecode: ${vidaraResult.filecode} in ${folderLabel}`);
 
         // Update Database
         await pool.query(`
