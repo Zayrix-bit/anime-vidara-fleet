@@ -1,8 +1,6 @@
 name: Anime Vidara Fleet Pipeline
 
 on:
-  schedule:
-    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       test_mode:
